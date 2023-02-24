@@ -1,0 +1,447 @@
+---
+title: "HW2"
+author: "Barboni Alessio - Redaelli Francesco"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table) # Read data
+library(dimRed) # Dimensionality reduction
+library(kernlab) # SVM
+library(caret) # Model pipeline
+library(ggplot2) # Visualization
+```
+
+# Part (A)
+## Exploratory data analysis and pre-processing
+
+```{r}
+
+# Data loading
+train_csv <- fread("train4final_hw.csv")
+test_csv <- fread("test4final_hw.csv")
+
+backup_train <- train_csv
+backup_test <- test_csv
+
+# Remove "id" column
+train_csv$id <- NULL
+test_csv$id <- NULL
+
+# Randomly select and remove 10 training obs (to be used in Part (B))
+set.seed(42)
+idx <- sample(1:dim(train_csv)[1], 10)
+train_aside <- train_csv[idx,1:7041]
+
+train <- train_csv[-idx,1:7040]
+test <- test_csv
+
+# Check columns variance
+sort(sapply(as.data.frame(train), var))[1:10]
+
+# Remove "prec.x" column (All values equal (Variance = 0), providing no information)
+train$prec.x <- NULL
+test$prec.x <- NULL
+train_aside$prec.x <- NULL
+
+# Correlation (with the response variable)
+corr_mat <- cor(train,y=train_csv$tempo[-idx])[,1]
+head(sort(corr_mat,decreasing = FALSE),10)
+head(sort(corr_mat,decreasing = TRUE),10)
+```
+
+In an attempt to reproduce the *2020-winning solution*, after an initial shallow pre-processing, we tried several approaches in terms of data selection/manipulation. Different datasets were fed as input to the modelling pipeline:
+
+1) The complete (pre-processed) dataset (in three versions: *original*, *column centered* and *column centered and scaled*). When centering and/or scaling were applied to the training set, the test set columns were transformed according to the training mean and standard deviation
+
+```{r, eval=FALSE}
+
+# Centering and scaling
+train_mean <- unlist(unname(lapply(train, mean)))
+train_sd <- unlist(unname(lapply(train, sd)))
+
+train <- as.data.frame(train)
+test <- as.data.frame(test)
+
+for(i in 1:length(train_mean)){
+  train[,i] <- (train[,i] - train_mean[i])/train_sd[i]
+  test[,i] <- (test[,i] - train_mean[i])/train_sd[i]
+}
+```
+
+2) A dataset containing the subset of columns whose *correlation* (in absolute value) with the target variable was above a given threshold $k$ (we tried with $k=0.1$ and $k=0.05$)
+
+```{r, eval=FALSE}
+
+k_tresh <- 0.1
+
+cols <- names(corr_mat[abs(corr_mat)>=k_tresh])
+train <- as.data.frame(train)[,cols]
+test <- as.data.frame(test)[,cols]
+```
+
+3) The dataset composed of the columns containing information about the *Mel-frequency cepstral coefficients* (the first 6840 columns), as we thought that they could provide an overall picture of the time-evolution of each song, in a homogeneous domain
+
+```{r}
+
+new_backup_train <- train
+new_backup_test <- test
+
+train <- train[,1:6840]
+test <- test[,1:6840]
+```
+
+The last approach led to the *best results*, and was the one kept for the final draft of the analysis.
+
+## Non-linear dimensionality reduction and modelling
+
+We firstly tackled the problem via a *Python* *scikit-learn* implementation, since we felt more comfortable and quicker in setting up a Cross-Validated tuning pipeline for *dimensionality reduction + SVM modelling* (*code uploaded on Moodle*).
+
+After reproducing the initial pre-processing, we built a pipeline that evaluated the output of a *Kernel Support Vector Machine Regression* ($SVR$) taking as input the result of a *Kernel Principal Component Analysis* ($kPCA$) on the MEL-frequencies restricted dataset.
+
+The pipeline was tuned via a *Grid Search* approach and the result scored in terms of *Cross-Validation Root Mean Squared Error* ($RMSE$). Each combination of the following possible parameters was tried:
+
+- *kPCA Kernel*: $polynomial, \; radial \; basis \; function \; (RBF)$
+- *SVR Kernel*: $linear, \; polynomial, \; radial \; basis \; function \; (RBF)$
+- *Poly kernel degree*: $[2,3,4,5,7,9,11,13]$
+- *SVR C*: $[10^ifor \; i \; in \; range(-3,4)]$
+- *SVR Epsilon*: $[10^i \; for \; i \; in \; range(-10,4)]$
+- *SVR Gamma*: $[10^i \; for \; i \; in \; range(-10,4)]$
+- *kPCA #Components*: $[5,10,15,20,25,30,50,75,100,150,200,All]$
+
+In order to further improve the $RMSE$, a manual optimization (*binary search* over the parameter range) in a neighborhood of the automatically selected parameters was carried out at each step. *In both the Python and R code, only the very final Grid Search step (list of values) is reported*.
+
+The pipeline made up of *kPCA (polynomial kernel, degree = 2, #components = 15)* + *SVR (RBF kernel)* led to the best performance.
+
+We then proceeded to reproduce this pipeline within *R*, selecting only the *top performing model* from *Python*. However, since the *parametrization* adopted by the various tools/libraries did not coincide, and we were aware that different implementations could lead to *inconsistent results* for the same parameters, we preferred to tune all the other *hyperparameters* of the selected models (as well as the number of kPCA components) over again.
+
+```{r, cache = TRUE, warning=FALSE}
+
+# kPCA
+ncomp_list <- c(15)
+
+values <- list()
+min_rmse <- Inf
+
+for(i in ncomp_list){
+  
+  # Fit-transform kPCA on training set
+  train_emb <- embed(train, "kPCA", kernel = "polydot", kpar = list(degree = 2), ndim=i)
+  new_train <- as.data.frame(getDimRedData(train_emb))
+  
+  # Transform test set
+  test_emb <- predict(train_emb,test)
+  new_test <- as.data.frame(getData(test_emb))
+  
+  # Set-up 5-Fold Cross-Validation for SVR
+  ctrl <- trainControl(method="cv",number=5)
+  
+  # Tune SVR model
+  svm.tune <- train(x=new_train,
+                    y= train_csv$tempo[-idx],
+                    method = "svmRadial",   # RBF kernel
+                    tuneGrid = data.frame(sigma=c(0.2),
+                                          C=c(4.5)),
+                    trControl=ctrl)
+  
+  # Store min RMSE and params in i-th step
+  values <- append(values, list(list(rmse = min(svm.tune$resample$RMSE), params = svm.tune$bestTune, ncomp = i)))
+  print(i)
+  
+  # Min RMSE up to i-th step
+  min_rmse <- min(min_rmse,min(svm.tune$resample$RMSE))
+  print(min_rmse)
+  
+}
+
+# Select parameters leading to min RMSE
+
+min_rmse <- Inf
+
+for(i in 1:length(values)){
+  if(values[[i]]$rmse<min_rmse){
+    min_rmse <- values[[i]]$rmse
+    ncomp <- values[[i]]$ncomp
+    knn <- values[[i]]$knn
+    id <- i
+  }
+}
+
+min_rmse
+best_sigma <- values[[id]]$params$sigma
+best_C <- values[[id]]$params$C
+best_ncomp <- ncomp
+
+# Fit-transform kPCA on training set with best params
+train_emb <- embed(train, "kPCA", kernel = "polydot", kpar = list(degree = 2), ndim=best_ncomp)
+new_train <- as.data.frame(getDimRedData(train_emb))
+
+# Transform test set with best params
+test_emb <- predict(train_emb,test)
+new_test <- as.data.frame(getData(test_emb))
+
+# Tune SVR model with best params
+svm.tune <- train(x=new_train,
+                    y= train_csv$tempo[-idx],
+                    method = "svmRadial",
+                    tuneGrid = data.frame(sigma=c(best_sigma),C=c(best_C)))
+
+# Predict on test set
+pred_test <- predict(svm.tune, newdata = new_test)
+out_df <- data.frame(id = backup_test[,7040], target = pred_test)
+
+write.csv(out_df,"C:\\Users\\Francesco\\Desktop\\submission.csv", row.names = FALSE,quote=FALSE)
+```
+The $CV RMSE$ on the training set is comparable with the *test set* one (computed by *Kaggle.com*), which is about $17.7$. This could suggest that the model generalizes rather fine to new observations and doesn't suffer too much from *overfitting*.
+
+However, this accuracy is still *far* from the one achieved by the *2020-winning team*; while we believe that working on a significantly *larger dataset* (as they did) would improve every model performance, we deem that further refined dimensionality reduction and tuning could reduce the error of our model even in the fewer observations settings. In fact, we were aware that by working on a *column-reduced version* of the original dataset at our disposal, we could be neglecting a *significant* amount of information, that might be crucial for regression purposes.
+
+In an attempt to address this issue, we tried implementing an *Isomap dimensionality reduction* step (instead of the *kPCA* one) on the *full uncut dataset*, without further luck in terms of results improvement (the unexecuted pipeline code can be found below).
+
+```{r, eval=FALSE}
+
+# Isomap
+
+ncomp_list <- rep(5,35,5)
+
+knn_list <- c(20,30,40,50)
+
+values <- list()
+
+min_rmse <- Inf
+
+for(j in knn_list){
+for(i in ncomp_list){
+  
+  # Fit-transform Isomap on training set
+  train_emb <- embed(new_backup_train, "Isomap", ndim=i, knn=j)
+  new_train <- as.data.frame(getDimRedData(train_emb))
+  
+  # Transform test set
+  test_emb <- predict(train_emb,new_backup_test)
+  new_test <- as.data.frame(getData(test_emb))
+
+  # Set-up 5-Fold Cross-Validation for SVR
+  ctrl <- trainControl(method="cv",number=5)
+  
+  # Tune SVR model
+  svm.tune <- train(x=new_train,
+                    y= train_csv$tempo[-idx],
+                    method = "svmRadial",   # RBF kernel
+                    tuneGrid = data.frame(sigma=c(0.01),C=c(0.001,0.01,0.1,1,10,100,200)),
+                    trControl=ctrl)
+  
+  # Store min RMSE and params in i-th step
+  values <- append(values, list(list(rmse = min(svm.tune$resample$RMSE), params = svm.tune$bestTune, ncomp = i, knn=j)))
+  
+  print(j)
+  print(i)
+  
+  # Min RMSE up to i-th step
+  min_rmse <- min(min_rmse,min(svm.tune$resample$RMSE))
+  print(min_rmse)
+  
+}
+}
+
+min_rmse <- Inf
+
+for(i in 1:length(values)){
+  if(values[[i]]$rmse<min_rmse){
+    min_rmse <- values[[i]]$rmse
+    ncomp <- values[[i]]$ncomp
+    knn <- values[[i]]$knn
+    id <- i
+  }
+}
+min_rmse
+best_sigma <- values[[id]]$params$sigma
+best_C <- values[[id]]$params$C
+best_ncomp <- ncomp
+best_knn <- knn
+
+# Fit-transform Isomap on training set with best params
+train_emb <- embed(new_backup_train, "Isomap", ndim=best_ncomp)
+new_train <- as.data.frame(getDimRedData(train_emb))
+
+# Transform test set with best params
+test_emb <- predict(train_emb,new_backup_test)
+new_test <- as.data.frame(getData(test_emb))
+
+# Tune SVR model with best params 
+svm.tune <- train(x=new_train,
+                    y= train_csv$tempo[-idx],
+                    method = "svmRadial",
+                    tuneGrid = data.frame(sigma=c(best_sigma),C=c(best_C)))
+
+# Predict on test set
+pred_test <- predict(svm.tune, newdata = new_test)
+out_df <- data.frame(id = new_backup_test[,7040], target = pred_test)
+
+#write.csv(out_df,"C:\\Users\\Francesco\\Desktop\\submission.csv", row.names = FALSE,quote=FALSE)
+```
+
+The final pipeline achieving the best *test set* $RMSE$ was made up of:
+
+- *kPCA (Dimensionality Reduction)*: ${Kernel = polynomial, \; degree = 2, \; n\_components = 15}$
+- *SVR (Model)*: ${Kernel = RBF, \; C = 4.5, \; sigma = 0.2}$
+
+It should be pointed out that both *theory* and *practical experience* highlight how parameters tuning *significantly* affects model performances. While we were working, we noticed that even a *slight* change in the hyperparameters value could bring the $RMSE$ up or down by several points. Although we tried a *fairly* large amount of possible values, we are confident that an even more *meticulous/informed search* could lead to *substantial improvements*, possibily by employing different *dimensionality reduction techniques* and/or *kernels*.
+
+# Part (B)
+
+```{r}
+
+# Split Conformal Prediction Algorithm
+
+SCPA <- function(D_n,D_n_y,alpha,cv_sigma,cv_C){
+  
+  n <- dim(D_n)[1]
+  
+  # Random split
+  set.seed(42)
+  idx <- sample(1:n,5)
+  D_1 <- as.data.frame(D_n[idx,], columns = names(D_n))
+  D_1_y <- D_n_y[idx]
+  D_2 <- as.data.frame(D_n[-idx,], columns = names(D_n))
+  D_2_y <- D_n_y[-idx]
+  
+  # Training
+  svm.tune <- train(x = D_1, y = D_1_y,
+                  method = "svmRadial",tuneGrid=data.frame(sigma=c(cv_sigma),C=c(cv_C)))
+  
+  # Predict and evaluate
+  pred <- predict(svm.tune, newdata = D_2)
+  
+  residuals <- abs(D_2_y-pred)
+  
+  # Compute k and d
+  k <- ceiling((n/2+1)*(1-alpha))
+  d <- sort(residuals)[k]
+  
+  return(list(model = svm.tune, d = d))
+}
+
+C_split <- function(D_n,model,d){
+  
+  n <- dim(D_n)[1]
+  
+  C_split_x <- list()
+  
+  for(i in 1:n){
+    
+    f_hat <- predict(model, newdata = D_n[i,])
+    C_split_x <- append(C_split_x, list(list(L = f_hat - d, U = f_hat + d)))
+  }
+  
+  return(C_split_x)
+}
+
+alpha <- 0.2
+
+```
+
+```{r, cache = TRUE, warning=FALSE}
+
+# Best CV parameters
+best_cv_sigma <- 0.2
+best_cv_C <- 4.5
+best_ncomp <- 15
+
+new_train_aside <- train_aside
+train_aside_y <- train_aside$tempo
+new_train_aside <- new_train_aside[,1:6840]
+
+# Fit kPCA on part (A) training set
+train_emb <- embed(train, "kPCA", kernel = "polydot", kpar = list(degree = 2), ndim=best_ncomp)
+```
+
+## Training
+
+```{r, cache = TRUE, warning=FALSE}
+
+# Transform training set
+train_aside_emb <- predict(train_emb,new_train_aside)
+kpca_train_aside <- as.data.frame(getData(train_aside_emb))
+
+D_n_train <- kpca_train_aside
+
+cp_model <- SCPA(D_n_train,train_aside_y,alpha,best_cv_sigma,best_cv_C)
+
+pred_sets <- C_split(D_n_train,cp_model$model,cp_model$d)
+
+n_pred <- length(pred_sets)
+
+L_vec <- rep(NA,n_pred)
+U_vec <- rep(NA,n_pred)
+
+for(i in 1:n_pred){
+  temp <- pred_sets[[i]]
+  L_vec[i] <- temp$L
+  U_vec[i] <- temp$U
+}
+
+obs <- 1:10
+tempo <- train_aside_y
+
+mydata <- data.frame(obs,tempo)
+
+ggplot(mydata, aes(x=obs, y=tempo)) +
+    geom_errorbar(width=.3, aes(ymin=L_vec, ymax=U_vec), col = "red", size = 1) +
+    geom_point(shape=21, size=4.5, fill="green") +
+    ggtitle("Split Conformal Prediction results") +
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+For $\alpha = 0.2$, the intervals for the $10$ new datapoints $(X_{n+1}, Y_{n+1})$ all cover the actual responses. However, since the $k-th$ residual $d:$
+
+```{r}
+cp_model$d
+```
+
+is larger than *half* the range of the tempo variable in the training set
+
+```{r}
+range(train_csv$tempo)
+```
+
+we believe such predictive sets might not be very informative.
+
+## Test
+
+```{r, cache = TRUE, warning=FALSE}
+
+idx <- sample(1:dim(test)[1], 100)
+test_aside <- test[idx,1:6840]
+
+# Transform test set
+test_aside_emb <- predict(train_emb,test_aside)
+D_n_test <- as.data.frame(getData(test_aside_emb))
+
+pred_sets <- C_split(D_n_test,cp_model$model,cp_model$d)
+
+n_pred <- length(pred_sets)
+
+L_vec <- rep(NA,n_pred)
+U_vec <- rep(NA,n_pred)
+
+for(i in 1:n_pred){
+  temp <- pred_sets[[i]]
+  L_vec[i] <- temp$L
+  U_vec[i] <- temp$U
+}
+
+obs <- 1:100
+tempo <- 1:100
+
+mydata <- data.frame(obs,tempo)
+
+ggplot(mydata, aes(x=obs,y=tempo)) +
+    geom_errorbar(width=1, aes(ymin=L_vec, ymax=U_vec), col = "red", size = 0.1) +
+    ggtitle("Split Conformal Prediction results") +
+    ylim(min(L_vec),max(U_vec)) +
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+Again, due to the *lack of accuracy* and the *not-so-high predictive power* of our model, a large residual $d$ causes the size of the predictive sets to be possibly even *larger* than the range of the predictions; in addition, the model tends to output response values exhibiting *small variability* (rather close to one another), which is reflected in the similarity of the predictive sets. As a result, while it's extremely likely that each *prediction band* contains the *true value* and the $Pr(Y_{n+1} \in C_{split}(X_{n+1})) \le 1-\alpha$ inequality is satisfied, the *Split Conformal Prediction for Regression algorithm* could end up providing little to no useful predictive information.
